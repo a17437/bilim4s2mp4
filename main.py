@@ -8,8 +8,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #### 设置 ####
-FILE_FROM = "from"  # B站缓存源目录
-OUT_DIR = "out"     # 导出根目录
+# 改为安卓端 B站默认下载路径
+FILE_FROM = "/storage/emulated/0/Android/data/tv.danmaku.bili/download/"  
+# 导出到当前目录的 out 文件夹下
+OUT_DIR = "./out"      
 LOG_FILE = "error.log"
 
 # 线程锁
@@ -52,11 +54,9 @@ def get_jellyfin_metadata(json_path):
             
             # 【判断是否为电影】通常电影的 index 是 "正片" 或空值
             if ep_index_raw == "正片" or not ep_index_raw:
-                # 电影标准结构: out/Movies/电影名/电影名.mp4
                 filename = f"{show_title}.mp4" if not ep_title else f"{show_title} - {ep_title}.mp4"
                 target_folder = os.path.join(OUT_DIR, "Movies", show_title)
             else:
-                # 剧集标准结构: out/TV Shows/剧集名/Season 01/剧集名 - S01E01 - 标题.mp4
                 ep_num = ep_index_raw.zfill(2) if ep_index_raw.isdigit() else ep_index_raw
                 filename = f"{show_title} - S01E{ep_num} - {ep_title}.mp4"
                 target_folder = os.path.join(OUT_DIR, "TV Shows", show_title, "Season 01")
@@ -68,16 +68,14 @@ def get_jellyfin_metadata(json_path):
             part_title = sanitize_filename(data["page_data"].get("part", "单P视频"))
             part_num = str(data["page_data"].get("page", "1")).zfill(2)
             
-            # 尝试获取 UP 主名字 (部分 B站缓存版本带有 owner_name)
+            # 尝试获取 UP 主名字
             owner = sanitize_filename(data.get("owner_name", ""))
             
-            # 为了避免冗余，如果合集标题和分P标题一模一样，就不重复拼接了
             if show_title == part_title:
                 filename = f"{show_title} - P{part_num}.mp4"
             else:
                 filename = f"{show_title} - P{part_num} - {part_title}.mp4"
             
-            # 结构: out/UP Videos/[UP主]视频标题/...
             folder_name = f"[{owner}] {show_title}" if owner else show_title
             target_folder = os.path.join(OUT_DIR, "UP Videos", folder_name)
 
@@ -108,8 +106,11 @@ def process_single_video(two_dir_path):
     audio_file = os.path.join(media_dir, "audio.m4s")
     
     if not os.path.isfile(video_file):
-        write_log(f"没有找到视频文件 video.m4s", media_dir)
-        return False
+        # 尝试兼容部分旧版本直接把 m4s 放在 two_dir_path 下的情况
+        video_file = os.path.join(two_dir_path, "video.m4s")
+        audio_file = os.path.join(two_dir_path, "audio.m4s")
+        if not os.path.isfile(video_file):
+            return False
 
     os.makedirs(target_folder, exist_ok=True)
     final_output_path = os.path.join(target_folder, target_filename)
@@ -136,7 +137,6 @@ def process_single_video(two_dir_path):
             
         shutil.move(temp_output_path, final_output_path)
         with log_lock:
-            # 打印相对路径，看起来更清爽
             rel_path = os.path.relpath(final_output_path, OUT_DIR)
             print(f"[合并成功] -> {rel_path}")
         return True
@@ -147,24 +147,40 @@ def process_single_video(two_dir_path):
 
 def main():
     print("="*50)
-    print("Bilibili 缓存多线程分离导出 (支持电影/番剧/UP主)")
+    print("Bilibili 安卓端缓存多线程分离导出")
+    print("目标读取路径:", FILE_FROM)
     print("="*50)
 
-    if not os.path.isdir(FILE_FROM):
-        print(f"找不到来源目录 '{FILE_FROM}'，请检查。")
+    # 权限及路径检查
+    if not os.path.exists(FILE_FROM):
+        print(f"\n[错误] 找不到来源目录 '{FILE_FROM}'。")
+        print(">>> 提示：如果你在手机端 (如 Termux) 运行，安卓 11+ 系统限制了对 /Android/data/ 的直接访问。")
+        print(">>> 解决方案 1：如果设备已 root，请使用 root 权限执行此脚本 (su -c python script.py)。")
+        print(">>> 解决方案 2：使用 MT管理器 等有权限的软件，将 download 文件夹复制到手机的常规目录 (如 /sdcard/bili_temp/)，然后修改代码中的 FILE_FROM 路径。\n")
         sys.exit(1)
 
     with open(LOG_FILE, 'w', encoding='utf-8') as f:
         f.write("=== 日志开始 ===\n")
 
     tasks = []
-    for one_dir in os.listdir(FILE_FROM):
-        one_dir_path = os.path.join(FILE_FROM, one_dir)
-        if not os.path.isdir(one_dir_path): continue
-        for two_dir in os.listdir(one_dir_path):
-            two_dir_path = os.path.join(one_dir_path, two_dir)
-            if os.path.isdir(two_dir_path):
-                tasks.append(two_dir_path)
+    
+    try:
+        for one_dir in os.listdir(FILE_FROM):
+            one_dir_path = os.path.join(FILE_FROM, one_dir)
+            if not os.path.isdir(one_dir_path): continue
+            
+            try:
+                for two_dir in os.listdir(one_dir_path):
+                    two_dir_path = os.path.join(one_dir_path, two_dir)
+                    if os.path.isdir(two_dir_path):
+                        tasks.append(two_dir_path)
+            except PermissionError:
+                print(f"[警告] 没有权限读取子文件夹: {one_dir_path}")
+                
+    except PermissionError:
+        print(f"\n[致命错误] 没有权限读取根目录 '{FILE_FROM}'！")
+        print(">>> 原因是安卓系统的 Scoped Storage 限制。请参考上面的解决方案转移文件。\n")
+        sys.exit(1)
 
     total = len(tasks)
     print(f"扫描完毕，共发现 {total} 个视频缓存。")
